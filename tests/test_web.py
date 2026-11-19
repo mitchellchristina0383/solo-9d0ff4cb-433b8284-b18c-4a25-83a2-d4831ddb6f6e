@@ -1,3 +1,4 @@
+import datetime as dt
 import os
 import sys
 import time
@@ -7,10 +8,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest
 from fastapi.testclient import TestClient
 
-from app import web
+from app import ntp_proto, web
 from app.clock import Sample
 from app.config import Settings
 from app.upstream import QueryOutcome, UpstreamConfig
+from tests.fakes import FakeUpstream
 
 
 class StubQuery:
@@ -166,3 +168,144 @@ def test_restart_ignores_old_history(app_client, tmp_path):
     assert fresh.clock.status().synced is False
     assert fresh.clock.status().state == "never-synced"
     assert fresh.clock.describe()["restored_history_samples"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# Expected-UTC handling / 2036 rollover in the web probe
+# ---------------------------------------------------------------------------
+WRAP = ntp_proto.NTP_WRAP_UNIX
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("2036-02-08", dt.datetime(2036, 2, 8, tzinfo=dt.timezone.utc).timestamp()),
+        ("2036-02-08T00:00:00Z", dt.datetime(2036, 2, 8, tzinfo=dt.timezone.utc).timestamp()),
+        ("2036-02-08 00:00:00", dt.datetime(2036, 2, 8, tzinfo=dt.timezone.utc).timestamp()),
+        ("2036-02-08T08:00:00+08:00", dt.datetime(2036, 2, 8, tzinfo=dt.timezone.utc).timestamp()),
+        ("", None),
+        ("   ", None),
+        (None, None),
+    ],
+)
+def test_parse_expected_utc(text, expected):
+    got = web._parse_expected_utc(text)
+    if expected is None:
+        assert got is None
+    else:
+        assert got == pytest.approx(expected)
+
+
+def test_parse_expected_utc_rejects_garbage():
+    with pytest.raises(ValueError):
+        web._parse_expected_utc("yesterday")
+    with pytest.raises(ValueError):
+        web._parse_expected_utc("2036-13-40")
+
+
+def test_probe_rejects_bad_expected_utc(app_client):
+    client, _state, _stub = app_client
+    r = client.post("/api/probe", json={"expected_utc": "not-a-date"})
+    assert r.status_code == 400
+    assert "预期 UTC" in r.json()["detail"]
+
+
+def _make_app_at(now_fn, tmp_path):
+    up = FakeUpstream(now_fn=now_fn)
+    settings = Settings(
+        upstreams=[UpstreamConfig("wrap", "127.0.0.1", up.addr[1], "回卷源")],
+        sample_interval=60.0, sample_timeout=0.2, holdover_seconds=30.0,
+        fresh_seconds=5.0, rollback_tolerance=0.25, ntp_host="127.0.0.1",
+        ntp_port=0, http_port=8000, data_path=str(tmp_path / "history.json"),
+        probe_timeout=0.2,
+    )
+    state = web.AppState(settings)
+    return up, web.create_app(settings, state=state)
+
+
+@pytest.mark.parametrize(
+    "instant",
+    [WRAP - 3600, WRAP + 3600],
+    ids=["before-wrap", "after-wrap"],
+)
+def test_web_probe_handles_rollover(tmp_path, instant):
+    """Valid replies on either side of the wrap are shown with real UTC."""
+    up, app = _make_app_at(lambda: instant, tmp_path)
+    iso = dt.datetime.fromtimestamp(instant, tz=dt.timezone.utc).date().isoformat()
+    expectation = dt.datetime.fromtimestamp(instant, tz=dt.timezone.utc).isoformat()
+    try:
+        with TestClient(app) as client:
+            r = client.post("/api/probe", json={"source_id": "wrap", "expected_utc": expectation})
+            body = r.json()
+        assert r.status_code == 200
+        out = body["results"][0]
+        assert out["ok"] is True, out["error"]
+        assert out["timestamps"]["receive"].startswith(iso)
+        assert out["timestamps"]["transmit"].startswith(iso)
+        assert out["reference"]["era"] == ntp_proto.era_for(instant)
+        upstream_ts = dt.datetime.fromisoformat(out["sample"]["upstream_iso"]).timestamp()
+        assert upstream_ts == pytest.approx(instant, abs=1.0)
+        # Relative delta is upstream time minus our receive wall clock, i.e.
+        # the same offset the probe reports (within loopback RTT/2).
+        assert out["sample"]["delta_vs_our_time"] == pytest.approx(
+            instant - out["sample"]["our_time"], abs=2e-3
+        )
+        assert 0 <= out["sample"]["rtt"] < 0.5
+    finally:
+        up.close()
+
+
+def test_web_probe_straddling_wrap_shows_ordered_timestamps(tmp_path):
+    """Receive before the rollover, transmit after: both decode, order holds."""
+    recv = WRAP - 0.00005
+    up, app = _make_app_at(lambda: recv, tmp_path)
+    try:
+        with TestClient(app) as client:
+            r = client.post(
+                "/api/probe",
+                json={"source_id": "wrap", "expected_utc": "2036-02-07T06:28:16Z"},
+            )
+        out = r.json()["results"][0]
+        assert out["ok"] is True, out["error"]
+        t2 = dt.datetime.fromisoformat(out["timestamps"]["receive"]).timestamp()
+        t3 = dt.datetime.fromisoformat(out["timestamps"]["transmit"]).timestamp()
+        assert t2 == pytest.approx(recv, abs=2e-3)
+        assert t3 == pytest.approx(recv + 0.0001, abs=2e-3)
+        assert t3 > t2
+        assert out["sample"]["rtt"] < 0.5
+    finally:
+        up.close()
+
+
+def test_web_probe_blank_expected_uses_local_date(tmp_path):
+    """Blank expectation falls back to the host clock at send time."""
+    before = time.time()
+    up, app = _make_app_at(lambda: time.time(), tmp_path)
+    try:
+        with TestClient(app) as client:
+            out = client.post("/api/probe", json={"source_id": "wrap"}).json()["results"][0]
+        after = time.time()
+        assert out["ok"] is True, out["error"]
+        assert out["reference"]["era"] == ntp_proto.era_for(time.time())
+        ref = dt.datetime.fromisoformat(out["reference"]["expected_utc"]).timestamp()
+        assert before - 1 <= ref <= after + 1
+    finally:
+        up.close()
+
+
+def test_web_probe_missing_timestamp_is_still_an_error(tmp_path):
+    up, app = _make_app_at(lambda: WRAP + 3600, tmp_path)
+    up.mode = "zero_recv"
+    try:
+        with TestClient(app) as client:
+            out = client.post(
+                "/api/probe",
+                json={"source_id": "wrap", "expected_utc": "2036-02-08"},
+            ).json()["results"][0]
+        assert out["ok"] is False
+        assert "missing receive/transmit" in out["error"]
+        # Diagnostic timestamps still show what did arrive.
+        assert out["timestamps"]["receive"] is None
+        assert out["timestamps"]["transmit"] is not None
+    finally:
+        up.close()

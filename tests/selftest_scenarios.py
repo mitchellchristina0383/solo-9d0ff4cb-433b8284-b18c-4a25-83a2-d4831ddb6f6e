@@ -24,7 +24,7 @@ from app import ntp_proto
 from app.clock import ClockState, HistoryStore
 from app.ntp_server import NtpServer
 from app.sampler import Sampler
-from app.upstream import UpstreamConfig
+from app.upstream import UpstreamConfig, query
 from tests.fakes import FakeUpstream
 
 HOLDOVER = 3.0
@@ -136,6 +136,50 @@ def main() -> int:
         server.stop()
         a.close()
         b.close()
+
+    # ---- 6. 2036 seconds-field rollover (diagnostic probe path) ------
+    wrap = ntp_proto.NTP_WRAP_UNIX
+    scenarios = [
+        ("回卷前应答按参照解码", wrap - 3600, wrap - 3600),
+        ("回卷后应答按参照解码", wrap + 3600, wrap + 3600),
+        ("接收/发送分处回卷点两侧", wrap - 0.00005, wrap - 0.00005),
+    ]
+    for label, source_now, expected in scenarios:
+        up = FakeUpstream(now_fn=lambda t=source_now: t)
+        try:
+            out = query(UpstreamConfig("w", "127.0.0.1", up.addr[1]),
+                        timeout=1.0, max_rtt=2.0, reference_time=wrap)
+            if out.ok:
+                got = out.sample.true_time
+                detail = (f"recv={out.recv_ts - wrap:+.6f}s tx={out.transmit_ts - wrap:+.6f}s "
+                          f"rtt={out.sample.delay * 1000:.3f}ms")
+            else:
+                got, detail = None, out.error or "no sample"
+            check(label,
+                  out.ok and got is not None and abs(got - expected) < 1.0,
+                  detail)
+        finally:
+            up.close()
+
+    up = FakeUpstream(now_fn=lambda: wrap + 3600)
+    up.mode = "zero_recv"
+    try:
+        out = query(UpstreamConfig("w", "127.0.0.1", up.addr[1]),
+                    timeout=1.0, max_rtt=2.0, reference_time=wrap + 3600)
+        check("缺失时间戳在回卷后仍报错",
+              not out.ok and "missing receive/transmit" in (out.error or ""),
+              out.error or "accepted?!")
+    finally:
+        up.close()
+
+    up = FakeUpstream(now_fn=lambda: wrap + 3600)
+    try:
+        out = query(UpstreamConfig("w", "127.0.0.1", up.addr[1]), timeout=1.0)
+        check("采样路径不按探测参照解释回卷后应答",
+              not out.ok and out.reference_time is None,
+              out.error or "accepted?!")
+    finally:
+        up.close()
 
     with open(os.path.join(data_dir, "selftest-report.json"), "w", encoding="utf-8") as fh:
         json.dump([{"name": n, "ok": ok, "detail": d} for n, ok, d in results], fh, indent=2, ensure_ascii=False)

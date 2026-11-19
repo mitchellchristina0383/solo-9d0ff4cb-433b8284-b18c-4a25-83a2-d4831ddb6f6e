@@ -10,6 +10,9 @@ about:
                              "lie":false,"spoof_origin":false,
                              "drop_responses":false}
   POST /api/step            {"delta": -3600}  (sudden rollback)
+  POST /api/wrap-preset     {"side":"before"|"after","seconds":1.0}
+                            (jump the fake clock to just before/after the
+                             2036 NTP seconds-field rollover)
 
 The NTP side is a real NTPv4 responder: it echoes the client transmit
 timestamp in origin, fills receive/transmit, and is honest about its own
@@ -47,6 +50,8 @@ class Config:
     spoof_origin: bool = False   # echo a wrong origin timestamp
     drop_responses: bool = False
     refid: str = "UPST"
+    stride: bool = False         # fabricate receive/transmit straddling the 2036 wrap
+    zero_recv: bool = False      # emit a zero receive timestamp (missing-timestamp case)
 
 
 class FakeUpstream:
@@ -111,6 +116,16 @@ class FakeUpstream:
 
         client_tx_bits = ntp_proto.transmit_bits(data)
         now = time.time() + cfg.offset
+        if cfg.stride:
+            # Reproduce the narrowest possible rollover case: receive lands
+            # 50 us before the seconds field wraps, transmit 50 us after.
+            recv = ntp_proto.NTP_WRAP_UNIX - 0.00005
+            transmit = ntp_proto.NTP_WRAP_UNIX + 0.00005
+            ref = recv - 10
+        else:
+            recv = now
+            transmit = now + 0.0001
+            ref = now - 10
         stratum = 16 if cfg.lie else cfg.stratum
         leap = 3 if cfg.lie else 0
         refid = b"\x00" * 4 if cfg.lie else cfg.refid.encode("ascii", "replace")[:4].ljust(4, b"\x00")
@@ -129,10 +144,10 @@ class FakeUpstream:
         )
         stamps = struct.pack(
             "!QQQQ",
-            ntp_proto.to_ntp_bits(now - 10),
+            ntp_proto.to_ntp_bits(ref),
             origin_bits,
-            ntp_proto.to_ntp_bits(now),
-            ntp_proto.to_ntp_bits(now + 0.0001),
+            0 if cfg.zero_recv else ntp_proto.to_ntp_bits(recv),
+            ntp_proto.to_ntp_bits(transmit),
         )
         reply = header + stamps
         try:
@@ -160,6 +175,8 @@ class FakeUpstream:
                 "http_port": self.http_port,
                 "config": asdict(self.cfg),
                 "now": now,
+                "now_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+                "ntp_era": int((now + ntp_proto.NTP_EPOCH_OFFSET) // ntp_proto.NTP_ERA_SECONDS),
                 "delta_from_host": self.cfg.offset,
                 "queries": self.queries,
                 "served": self.served,
@@ -169,7 +186,8 @@ class FakeUpstream:
 
     def update(self, payload: dict) -> dict:
         with self.lock:
-            for key in ("offset", "enabled", "stratum", "lie", "spoof_origin", "drop_responses", "refid"):
+            for key in ("offset", "enabled", "stratum", "lie", "spoof_origin",
+                        "drop_responses", "refid", "stride", "zero_recv"):
                 if key not in payload:
                     continue
                 value = payload[key]
@@ -189,6 +207,13 @@ class FakeUpstream:
     def step(self, delta: float) -> dict:
         with self.lock:
             self.cfg.offset += float(delta)
+        return self.snapshot()
+
+    def wrap_preset(self, side: str, seconds: float) -> dict:
+        """Move the fake clock just before or after the 2036 rollover."""
+        target = ntp_proto.NTP_WRAP_UNIX + (-abs(seconds) if side == "before" else abs(seconds))
+        with self.lock:
+            self.cfg.offset = target - time.time()
         return self.snapshot()
 
 
@@ -214,6 +239,8 @@ pre{{background:#1a1a1a;padding:.6rem;border-radius:6px;overflow:auto;max-height
 <table>
 <tr><th>NTP 端口</th><td>{snap['ntp_port']}/udp</td></tr>
 <tr><th>当前伪时间</th><td id="now">{snap['now']:.3f}</td></tr>
+<tr><th>当前伪时间 (UTC)</th><td id="now-iso">{snap['now_iso']}</td></tr>
+<tr><th>NTP 纪元</th><td id="era">{snap['ntp_era']}</td></tr>
 <tr><th>相对宿主偏移</th><td>{cfg['offset']:+.3f} s</td></tr>
 <tr><th>启用</th><td>{cfg['enabled']}</td></tr>
 <tr><th>层数</th><td>{cfg['stratum']}</td></tr>
@@ -234,6 +261,12 @@ pre{{background:#1a1a1a;padding:.6rem;border-radius:6px;overflow:auto;max-height
 <button onclick="post('/api/config',{{drop_responses:true}})">丢包</button>
 <button onclick="post('/api/config',{{drop_responses:false}})">恢复应答</button>
 <button onclick="post('/api/step',{{delta:-3600}})">回拨 1 小时</button>
+<button onclick="post('/api/wrap-preset',{{side:'before',seconds:5}})">回卷点前 5 秒</button>
+<button onclick="post('/api/wrap-preset',{{side:'after',seconds:5}})">回卷点后 5 秒</button>
+<button onclick="post('/api/config',{{stride:true}})">制造跨界应答</button>
+<button onclick="post('/api/config',{{stride:false}})">停止跨界应答</button>
+<button onclick="post('/api/config',{{zero_recv:true}})">清零接收时间戳</button>
+<button onclick="post('/api/config',{{zero_recv:false}})">恢复正常时间戳</button>
 <button onclick="post('/api/config',{{offset:0}})">对齐宿主</button>
 <button onclick="post('/api/config',{{lie:true}})">谎报未同步</button>
 <button onclick="post('/api/config',{{lie:false}})">停止谎报</button>
@@ -249,6 +282,8 @@ async function post(url, body) {{
 setInterval(async () => {{
   const r = await fetch('/api/state'); const j = await r.json();
   document.getElementById('now').textContent = j.now.toFixed(3);
+  document.getElementById('now-iso').textContent = j.now_iso;
+  document.getElementById('era').textContent = j.ntp_era;
 }}, 1000);
 </script>
 </html>"""
@@ -286,6 +321,16 @@ async def api_config(request: Request) -> JSONResponse:
 async def api_step(request: Request) -> JSONResponse:
     payload = await request.json()
     return JSONResponse(fake.step(float(payload.get("delta", 0))))
+
+
+@app.post("/api/wrap-preset")
+async def api_wrap_preset(request: Request) -> JSONResponse:
+    payload = await request.json()
+    side = str(payload.get("side", "after"))
+    if side not in ("before", "after"):
+        return JSONResponse({"error": "side must be 'before' or 'after'"}, status_code=400)
+    seconds = float(payload.get("seconds", 1.0))
+    return JSONResponse(fake.wrap_preset(side, seconds))
 
 
 @app.get("/healthz")

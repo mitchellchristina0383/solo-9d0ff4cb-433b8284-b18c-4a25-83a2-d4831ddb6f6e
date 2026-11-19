@@ -9,11 +9,16 @@ never trusted on its own.
 
 from __future__ import annotations
 
+import math
 import struct
 from dataclasses import dataclass
 
 NTP_EPOCH_OFFSET = 2_208_988_800  # seconds between 1900-01-01 and 1970-01-01
 NTP_PACKET_SIZE = 48
+# The 32-bit NTP seconds field wraps every 2**32 seconds (~136 years); the
+# current era ends at 2036-02-07 06:28:16 UTC.
+NTP_ERA_SECONDS = 1 << 32
+NTP_WRAP_UNIX = NTP_ERA_SECONDS - NTP_EPOCH_OFFSET  # 2036-02-07 06:28:16 UTC
 
 # mode values
 MODE_CLIENT = 3
@@ -46,6 +51,11 @@ class NtpPacket:
     recv_ts: float | None
     transmit_ts: float
     raw: bytes
+    # Raw wire fields, before any era/epoch interpretation.
+    ref_bits: int = 0
+    origin_bits: int = 0
+    recv_bits: int = 0
+    transmit_bits: int = 0
 
     @property
     def root_delay_s(self) -> float:
@@ -103,6 +113,29 @@ def _from_ntp(value: int) -> float | None:
     return seconds - NTP_EPOCH_OFFSET + fraction / (1 << 32)
 
 
+def _from_ntp_near(value: int, reference: float) -> float | None:
+    """Decode a timestamp near ``reference``, resolving era wrap.
+
+    The NTP seconds field is only 32 bits, so every raw value recurs once
+    per 136-year era.  We choose the era whose instant is nearest to the
+    reference (the local send time of this probe).  That keeps the three
+    server timestamps in one consistent era *and* still decodes correctly
+    when, say, receive is just before the rollover and transmit just after.
+    """
+    if value == 0:
+        return None
+    raw_seconds = (value >> 32) & 0xFFFFFFFF
+    fraction = value & 0xFFFFFFFF
+    # Reference unix time -> NTP seconds; pick the near-integer era shift.
+    era = int(math.floor(((reference + NTP_EPOCH_OFFSET) - raw_seconds) / NTP_ERA_SECONDS + 0.5))
+    return raw_seconds - NTP_EPOCH_OFFSET + era * NTP_ERA_SECONDS + fraction / (1 << 32)
+
+
+def era_for(ts: float) -> int:
+    """Number of 2**32-second wraps in a POSIX timestamp (1900-based)."""
+    return int(math.floor((ts + NTP_EPOCH_OFFSET) / NTP_ERA_SECONDS))
+
+
 def _short_float(value: int) -> float:
     return (value >> 16) + (value & 0xFFFF) / 65536.0
 
@@ -116,7 +149,16 @@ def _short_float_bits(seconds: float) -> int:
     return fixed
 
 
-def decode(data: bytes) -> NtpPacket:
+def decode(data: bytes, *, reference: float | None = None) -> NtpPacket:
+    """Parse a datagram.
+
+    ``reference`` is the POSIX time this packet is interpreted around (the
+    local wall clock at send time for an outbound probe).  When given, the
+    server timestamps are resolved to the era nearest that instant, which is
+    what makes replies still correct across the 2036 seconds-field rollover.
+    Without it the legacy era-0 interpretation is kept (used for requests,
+    whose only meaningful field is the echoed origin bits).
+    """
     if len(data) < NTP_PACKET_SIZE:
         raise NtpFormatError(f"short packet ({len(data)} bytes)")
     (first,) = struct.unpack_from("!B", data, 0)
@@ -125,7 +167,17 @@ def decode(data: bytes) -> NtpPacket:
     mode = first & 0x7
     stratum, poll, precision = struct.unpack_from("!BBb", data, 1)  # poll read unsigned, precision signed
     root_delay, root_dispersion, ref_id = struct.unpack_from("!II4s", data, 4)
-    ref_ts, origin_ts, recv_ts, transmit_ts = struct.unpack_from("!QQQQ", data, 16)
+    ref_bits, origin_bits, recv_bits, transmit_bits = struct.unpack_from("!QQQQ", data, 16)
+    if reference is None:
+        ref_ts = _from_ntp(ref_bits)
+        origin_ts = _from_ntp(origin_bits)
+        recv_ts = _from_ntp(recv_bits)
+        transmit_ts = _from_ntp(transmit_bits) or 0.0
+    else:
+        ref_ts = _from_ntp_near(ref_bits, reference)
+        origin_ts = _from_ntp_near(origin_bits, reference)
+        recv_ts = _from_ntp_near(recv_bits, reference)
+        transmit_ts = _from_ntp_near(transmit_bits, reference) or 0.0
     return NtpPacket(
         leap=leap,
         version=version,
@@ -136,11 +188,15 @@ def decode(data: bytes) -> NtpPacket:
         root_delay=_short_float(root_delay),
         root_dispersion=_short_float(root_dispersion),
         ref_id=ref_id,
-        ref_ts=_from_ntp(ref_ts),
-        origin_ts=_from_ntp(origin_ts),
-        recv_ts=_from_ntp(recv_ts),
-        transmit_ts=_from_ntp(transmit_ts) or 0.0,
+        ref_ts=ref_ts,
+        origin_ts=origin_ts,
+        recv_ts=recv_ts,
+        transmit_ts=transmit_ts,
         raw=data[:NTP_PACKET_SIZE],
+        ref_bits=ref_bits,
+        origin_bits=origin_bits,
+        recv_bits=recv_bits,
+        transmit_bits=transmit_bits,
     )
 
 

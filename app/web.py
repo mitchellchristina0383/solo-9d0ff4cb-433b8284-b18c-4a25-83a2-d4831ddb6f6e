@@ -13,7 +13,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
-from . import upstream
+from . import ntp_proto, upstream
 from .clock import ClockState, EventLog, HistoryStore
 from .config import Settings, load_settings
 from .ntp_server import NtpServer
@@ -28,6 +28,14 @@ class SourceToggle(BaseModel):
 class ProbeRequest(BaseModel):
     source_id: str | None = None
     timeout: float = Field(default=2.0, ge=0.1, le=10.0)
+    # Expected UTC date/time of the upstream.  Only the NTP era matters for
+    # decoding, but accepting a full datetime lets the operator type what
+    # they see.  Blank means "use the local date at send time".
+    expected_utc: str | None = None
+
+
+class SelfProbeRequest(BaseModel):
+    expected_utc: str | None = None
 
 
 class PauseRequest(BaseModel):
@@ -73,6 +81,36 @@ def _iso(value: float | None) -> str | None:
     if value is None:
         return None
     return dt.datetime.fromtimestamp(value, tz=dt.timezone.utc).isoformat(timespec="milliseconds")
+
+
+def _parse_expected_utc(raw: str | None) -> float | None:
+    """Parse the optional "expected UTC" field into a POSIX instant.
+
+    Accepted forms are a date (``2036-02-08``), a datetime
+    (``2036-02-08 12:34:56`` or with a ``T``), optionally with a trailing
+    ``Z`` or numeric offset.  A trailing offset is honoured, everything
+    else is taken as UTC.  Only the NTP era is decided from this value, so
+    a plain date is precise enough.
+    """
+    if raw is None:
+        return None
+    text = raw.strip()
+    if not text:
+        return None
+    normalized = text[:-1] + "+00:00" if text[-1:].lower() == "z" else text
+    try:
+        if len(normalized) <= 10:
+            day = dt.date.fromisoformat(normalized)
+            parsed = dt.datetime(day.year, day.month, day.day, tzinfo=dt.timezone.utc)
+        else:
+            parsed = dt.datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise ValueError(
+            f"无法解析预期 UTC 日期 {raw!r}；请用 2036-02-08 或 2036-02-08T12:34:56 这类格式"
+        ) from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.timestamp()
 
 
 def create_app(settings: Settings | None = None, state: AppState | None = None) -> FastAPI:
@@ -155,13 +193,18 @@ def create_app(settings: Settings | None = None, state: AppState | None = None) 
             targets = list(st.settings.upstreams)
 
         results = []
+        reference = _probe_reference(body.expected_utc)
         for cfg in targets:
-            outcome = upstream.query(cfg, timeout=body.timeout)
+            outcome = upstream.query(cfg, timeout=body.timeout, reference_time=reference)
             results.append(_outcome_dict(cfg, outcome))
-        return JSONResponse({"probed_at": time.time(), "results": results})
+        return JSONResponse({
+            "probed_at": time.time(),
+            "expected_utc": _iso(reference),
+            "results": results,
+        })
 
     @app.post("/api/probe/server")
-    def api_probe_self() -> JSONResponse:
+    def api_probe_self(body: SelfProbeRequest | None = None) -> JSONResponse:
         """Loopback NTP request against *our own* responder.
 
         Proves end-to-end that the daemon is answering with what the UI shows.
@@ -169,8 +212,13 @@ def create_app(settings: Settings | None = None, state: AppState | None = None) 
         st: AppState = app.state.ntp
         port = st.server.bound_port or st.settings.ntp_port
         cfg = UpstreamConfig("self", "127.0.0.1", port, "本机服务")
-        outcome = upstream.query(cfg, timeout=2.0)
-        return JSONResponse({"probed_at": time.time(), "results": [_outcome_dict(cfg, outcome)]})
+        reference = _probe_reference(body.expected_utc if body else None)
+        outcome = upstream.query(cfg, timeout=2.0, reference_time=reference)
+        return JSONResponse({
+            "probed_at": time.time(),
+            "expected_utc": _iso(reference),
+            "results": [_outcome_dict(cfg, outcome)],
+        })
 
     @app.post("/api/sampler/paused")
     def api_pause(body: PauseRequest) -> JSONResponse:
@@ -188,6 +236,15 @@ def create_app(settings: Settings | None = None, state: AppState | None = None) 
     return app
 
 
+def _probe_reference(expected_utc: str | None) -> float:
+    """Reference instant for a probe: explicit expectation or local now."""
+    try:
+        parsed = _parse_expected_utc(expected_utc)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return parsed if parsed is not None else time.time()
+
+
 def _outcome_dict(cfg: UpstreamConfig, outcome: upstream.QueryOutcome) -> dict:
     data = {
         "source_id": cfg.id,
@@ -202,6 +259,16 @@ def _outcome_dict(cfg: UpstreamConfig, outcome: upstream.QueryOutcome) -> dict:
         "rtt": outcome.rtt,
         "kiss_code": outcome.kiss_code,
     }
+    if outcome.reference_time is not None:
+        data["reference"] = {
+            "expected_utc": _iso(outcome.reference_time),
+            "era": ntp_proto.era_for(outcome.reference_time),
+        }
+        data["timestamps"] = {
+            "reference": _iso(outcome.ref_ts),
+            "receive": _iso(outcome.recv_ts),
+            "transmit": _iso(outcome.transmit_ts),
+        }
     if outcome.sample is not None:
         s = outcome.sample
         data["sample"] = {

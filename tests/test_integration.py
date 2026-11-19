@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest
 
 from app.clock import ClockState
+from app import ntp_proto
 from app.ntp_server import NtpServer
 from app.sampler import Sampler
 from app.upstream import UpstreamConfig, query
@@ -46,6 +47,89 @@ def test_query_rejects_bad_replies(upstream, mode):
     out = query(cfg, timeout=0.6, max_rtt=2.0)
     assert not out.ok
     assert out.error
+
+
+# ---------------------------------------------------------------------------
+# 2036 NTP seconds-field rollover
+# ---------------------------------------------------------------------------
+WRAP = ntp_proto.NTP_WRAP_UNIX
+
+
+def test_query_before_wrap_decodes_without_reference(upstream):
+    """Pre-wrap seconds values are already unambiguous in the legacy era."""
+    upstream.now_fn = lambda: WRAP - 3600
+    cfg = UpstreamConfig("x", "127.0.0.1", upstream.addr[1])
+    out = query(cfg, timeout=1.0, max_rtt=2.0)
+    assert out.ok, out.error
+    assert out.sample.true_time == pytest.approx(WRAP - 3600, abs=1.0)
+    assert out.recv_ts == pytest.approx(WRAP - 3600, abs=1.0)
+
+
+def test_sampler_path_does_not_era_shift_a_2036_demo_source():
+    """Never let the diagnostic era guess turn into a ten-year clock step.
+
+    ``query`` without an explicit probe reference keeps the historical
+    decoding rule: a post-rollover reply is reported unusable rather than
+    being reinterpreted as a 2036 sample for the live clock.
+    """
+    up = FakeUpstream(now_fn=lambda: WRAP + 3600)
+    try:
+        cfg = UpstreamConfig("x", "127.0.0.1", up.addr[1])
+        out = query(cfg, timeout=1.0, max_rtt=2.0)  # no reference_time
+        assert out.reference_time is None
+        assert not out.ok
+        # Legacy decoding yields negative values, which the sanity checks
+        # already reject as unusable — no silent ten-year forward step.
+        assert "zero transmit timestamp" in (out.error or "")
+    finally:
+        up.close()
+
+
+def test_query_after_wrap_reports_valid_reply():
+    """Seconds field ~0 after the rollover must not look like a missing ts."""
+    up = FakeUpstream(now_fn=lambda: WRAP + 3600)
+    try:
+        cfg = UpstreamConfig("x", "127.0.0.1", up.addr[1])
+        out = query(cfg, timeout=1.0, max_rtt=2.0, reference_time=WRAP + 3600)
+        assert out.ok, out.error
+        assert out.sample.true_time == pytest.approx(WRAP + 3600, abs=1.0)
+        # Relative to the local wall clock the source is years ahead, which
+        # is reported rather than hidden.
+        assert out.sample.offset > 200_000_000
+    finally:
+        up.close()
+
+
+def test_query_straddling_wrap_receives_and_transmits_on_both_sides():
+    """Receive just before the rollover, transmit just after (same exchange)."""
+    recv = WRAP - 0.00005
+    transmit = WRAP + 0.00005
+    up = FakeUpstream(now_fn=lambda: recv)
+    try:
+        cfg = UpstreamConfig("x", "127.0.0.1", up.addr[1])
+        out = query(cfg, timeout=1.0, max_rtt=2.0, reference_time=WRAP)
+        assert out.ok, out.error
+        t2, t3 = out.recv_ts, out.transmit_ts
+        assert t2 == pytest.approx(recv, abs=1e-6)
+        # FakeUpstream transmits at now+0.1ms, which is past the wrap.
+        assert t3 == pytest.approx(recv + 0.0001, abs=1e-6)
+        assert t3 > t2
+        assert out.sample.delay >= 0
+    finally:
+        up.close()
+
+
+def test_query_missing_timestamp_is_still_an_error_across_wrap():
+    up = FakeUpstream(now_fn=lambda: WRAP + 3600)
+    up.mode = "zero_recv"
+    try:
+        cfg = UpstreamConfig("x", "127.0.0.1", up.addr[1])
+        out = query(cfg, timeout=1.0, max_rtt=2.0, reference_time=WRAP + 3600)
+        assert not out.ok
+        assert "missing receive/transmit" in out.error
+        assert out.recv_ts is None
+    finally:
+        up.close()
 
 
 def test_query_ignores_reply_from_wrong_port(upstream):

@@ -88,9 +88,11 @@ input[type=text] { background:#0c0f13; border:1px solid #2b333e; color:#e6e6e6; 
       <h2>发送真实 NTP 请求</h2>
       <div class="row">
         <input type="text" id="probe-source" placeholder="来源 id（留空=全部）" size="18">
+        <input type="text" id="probe-expected" placeholder="预期 UTC 日期（留空=本机日期）" size="26">
         <button onclick="probe()">查询上游</button>
         <button class="secondary" onclick="probeSelf()">查询本机服务</button>
       </div>
+      <div class="muted" style="margin-top:.35rem">预期 UTC 日期用于跨 NTP 秒字段回卷点（2036-02-07）解释应答时间戳，例如 <code>2036-02-08</code> 或 <code>2036-02-08T00:00:00Z</code>。</div>
       <div id="probe-out" class="muted">尚未发送请求。</div>
     </section>
 
@@ -198,26 +200,74 @@ async function toggleSource(id, enabled) {
 async function probe(sourceId) {
   const input = document.getElementById("probe-source");
   const sid = sourceId || input.value.trim() || null;
+  const expected = document.getElementById("probe-expected").value.trim() || null;
   const out = document.getElementById("probe-out");
   out.className = ""; out.innerHTML = "请求中…";
   const r = await fetch("/api/probe", {
     method: "POST", headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({source_id: sid, timeout: 2})});
+    body: JSON.stringify({source_id: sid, timeout: 2, expected_utc: expected})});
+  if (!r.ok) {
+    const body = await r.json().catch(() => ({}));
+    out.className = "err";
+    out.textContent = "探测请求失败：" + (body.detail || r.status);
+    return;
+  }
   renderProbe(await r.json());
 }
 async function probeSelf() {
+  const expected = document.getElementById("probe-expected").value.trim() || null;
   const out = document.getElementById("probe-out");
   out.className = ""; out.innerHTML = "请求中…";
-  const r = await fetch("/api/probe/server", {method: "POST"});
+  const r = await fetch("/api/probe/server", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({expected_utc: expected})});
+  if (!r.ok) {
+    const body = await r.json().catch(() => ({}));
+    out.className = "err";
+    out.textContent = "探测请求失败：" + (body.detail || r.status);
+    return;
+  }
   renderProbe(await r.json());
+}
+function fmtIso(v) {
+  if (v === null || v === undefined) return "–";
+  // Probe timestamps arrive as ISO-8601 strings; accept epoch seconds too.
+  const d = typeof v === "number" ? new Date(v * 1000) : new Date(v);
+  if (isNaN(d.getTime())) return "–";
+  return d.toISOString().replace("T", " ").replace("Z", " UTC");
 }
 function renderProbe(data) {
   const out = document.getElementById("probe-out");
-  out.innerHTML = data.results.map(res => {
-    const detail = res.ok
-      ? `offset ${res.sample.offset >= 0 ? "+" : ""}${res.sample.offset.toFixed(6)} s · RTT ${(res.sample.rtt*1000).toFixed(3)} ms · 上游时间 ${res.sample.upstream_iso}`
-      : `<span class="err">失败：${escapeHtml(res.error || "unknown")}</span>`;
-    return `<div style="margin:.35rem 0"><code>${escapeHtml(res.address)}</code> ${res.ok ? '<span class="badge ok">有效应答</span>' : '<span class="badge bad">无有效应答</span>'}<div class="muted mono">${detail}</div></div>`;
+  const head = data.expected_utc
+    ? `<div class="muted">本次参照（预期 UTC）：<code>${escapeHtml(fmtIso(data.expected_utc))}</code></div>`
+    : "";
+  out.innerHTML = head + data.results.map(res => {
+    let detail;
+    if (res.ok) {
+      const s = res.sample;
+      const delta = s.delta_vs_our_time;
+      detail = `
+        <div>上游时间 <b class="mono">${fmtIso(s.upstream_iso)}</b></div>
+        <div>相对本机 <span class="mono">${delta >= 0 ? "+" : ""}${delta.toFixed(6)} s</span>
+          · offset <span class="mono">${s.offset >= 0 ? "+" : ""}${s.offset.toFixed(6)} s</span>
+          · 往返延迟 <span class="mono">${(s.rtt * 1000).toFixed(3)} ms</span></div>`;
+      if (res.timestamps) {
+        detail += `<div>参考 <span class="mono">${fmtIso(res.timestamps.reference)}</span>
+          · 接收 <span class="mono">${fmtIso(res.timestamps.receive)}</span>
+          · 发送 <span class="mono">${fmtIso(res.timestamps.transmit)}</span></div>`;
+      }
+    } else {
+      detail = `<span class="err">失败：${escapeHtml(res.error || "unknown")}</span>`;
+      if (res.timestamps) {
+        detail += `<div class="muted mono">参考 ${fmtIso(res.timestamps.reference)}
+          · 接收 ${fmtIso(res.timestamps.receive)}
+          · 发送 ${fmtIso(res.timestamps.transmit)}</div>`;
+      }
+    }
+    const badge = res.ok
+      ? '<span class="badge ok">有效应答</span>'
+      : '<span class="badge bad">无有效应答</span>';
+    return `<div style="margin:.5rem 0"><code>${escapeHtml(res.address)}</code> ${badge}<div class="muted" style="line-height:1.6">${detail}</div></div>`;
   }).join("");
 }
 async function tick() { try { render(await getStatus()); } catch (e) {} }

@@ -18,13 +18,19 @@ class FakeUpstream:
       liar        answer with LI=3 / stratum 16 (unsynchronised)
       bad_origin  echo the wrong origin timestamp (spoof/wrong-reply)
       bad_mode    answer with mode 3 (client) instead of server
+      zero_recv   answer with a zero (missing) receive timestamp
+
+    ``now_fn`` overrides the served clock entirely (used to emulate an
+    upstream beyond the 2036 NTP seconds-field rollover).
     """
 
-    def __init__(self, port: int = 0, offset: float = 0.0, host: str = "127.0.0.1") -> None:
+    def __init__(self, port: int = 0, offset: float = 0.0, host: str = "127.0.0.1",
+                 now_fn=None) -> None:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind((host, port))
         self.addr = self.sock.getsockname()
         self.offset = offset
+        self.now_fn = now_fn
         self.mode = "ok"
         self.queries = 0
         self.lock = threading.Lock()
@@ -33,6 +39,8 @@ class FakeUpstream:
         self.thread.start()
 
     def now(self) -> float:
+        if self.now_fn is not None:
+            return self.now_fn()
         return time.time() + self.offset
 
     def _run(self) -> None:
@@ -44,7 +52,7 @@ class FakeUpstream:
                 continue
             with self.lock:
                 self.queries += 1
-                mode, offset = self.mode, self.offset
+                mode = self.mode
             if mode == "silent" or len(data) < 48:
                 continue
             try:
@@ -52,7 +60,7 @@ class FakeUpstream:
             except ntp_proto.NtpFormatError:
                 continue
             reply_mode = ntp_proto.MODE_CLIENT if mode == "bad_mode" else ntp_proto.MODE_SERVER
-            now = time.time() + offset
+            now = self.now()
             origin = ntp_proto.transmit_bits(data)
             if mode == "bad_origin":
                 origin ^= 1
@@ -63,7 +71,8 @@ class FakeUpstream:
                 poll=req.poll, precision=-20, root_delay=0.001,
                 root_dispersion=0.002, ref_id=b"TEST",
                 ref_ts=now - 10, origin_ts=None, origin_bits=origin,
-                recv_ts=now, transmit_ts=now + 0.0001,
+                recv_ts=None if mode == "zero_recv" else now,
+                transmit_ts=now + 0.0001,
             )
             try:
                 self.sock.sendto(reply, peer)
