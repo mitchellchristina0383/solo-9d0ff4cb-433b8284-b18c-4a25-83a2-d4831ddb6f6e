@@ -1,0 +1,82 @@
+name: isolated-ntp
+
+services:
+  ntp-service:
+    build: .
+    container_name: ntp-service
+    restart: unless-stopped
+    # Bound to UDP 123 inside the isolated network; the container is given
+    # only the capability needed to bind the privileged port.
+    cap_drop: ["ALL"]
+    cap_add: ["NET_BIND_SERVICE"]
+    ports:
+      - "123:123/udp"
+      - "8000:8000"
+    environment:
+      UPSTREAMS: >-
+        [{"id":"upstream-a","host":"upstream-a","port":123,"label":"上游 A"},
+         {"id":"upstream-b","host":"upstream-b","port":123,"label":"上游 B"}]
+      SAMPLE_INTERVAL: "4"
+      SAMPLE_TIMEOUT: "2"
+      # Free-run window after the last confirmed sample before we refuse to
+      # call ourselves synchronised. Keep modest; it is a trust budget.
+      HOLDOVER_SECONDS: "120"
+      FRESH_SECONDS: "10"
+      ROLLBACK_TOLERANCE: "0.25"
+      NTP_BIND: "0.0.0.0"
+      NTP_PORT: "123"
+      HTTP_PORT: "8000"
+      DATA_PATH: "/data/history.json"
+      TZ: "UTC"
+    volumes:
+      - ntp-data:/data
+    depends_on:
+      upstream-a:
+        condition: service_started
+      upstream-b:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2).status==200 else 1)"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  upstream-a:
+    build: .
+    container_name: ntp-upstream-a
+    restart: unless-stopped
+    cap_drop: ["ALL"]
+    cap_add: ["NET_BIND_SERVICE"]
+    command: ["python", "fake_upstream/server.py", "--name", "A", "--ntp-port", "123", "--http-port", "8081"]
+    environment:
+      INITIAL_OFFSET: "0"
+      TZ: "UTC"
+    ports:
+      - "8081:8081"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8081/healthz', timeout=2).status==200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  upstream-b:
+    build: .
+    container_name: ntp-upstream-b
+    restart: unless-stopped
+    cap_drop: ["ALL"]
+    cap_add: ["NET_BIND_SERVICE"]
+    command: ["python", "fake_upstream/server.py", "--name", "B", "--ntp-port", "123", "--http-port", "8082"]
+    environment:
+      INITIAL_OFFSET: "0"
+      TZ: "UTC"
+    ports:
+      - "8082:8082"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8082/healthz', timeout=2).status==200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  ntp-data:

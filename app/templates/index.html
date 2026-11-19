@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>隔离网 NTP 服务</title>
+<style>
+:root { color-scheme: dark; }
+* { box-sizing: border-box; }
+body { font-family: system-ui, -apple-system, "Noto Sans SC", sans-serif; margin: 0; background:#0f1114; color:#e6e6e6; }
+header { padding: 1.1rem 1.5rem; background:#161a20; border-bottom:1px solid #262c35; display:flex; gap:1rem; align-items:baseline; flex-wrap:wrap; }
+h1 { font-size: 1.15rem; margin:0; font-weight:650; letter-spacing:.02em; }
+main { padding: 1.2rem 1.5rem 3rem; max-width:1180px; margin:0 auto; }
+.grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(320px,1fr)); gap:1rem; }
+.card { background:#161a20; border:1px solid #262c35; border-radius:10px; padding:1rem 1.1rem; }
+.card h2 { font-size:.82rem; text-transform:uppercase; letter-spacing:.09em; color:#8b98a8; margin:0 0 .7rem; font-weight:600; }
+table { border-collapse: collapse; width:100%; font-size:.86rem; }
+th, td { text-align:left; padding:.32rem .3rem; border-bottom:1px solid #222831; vertical-align:top; }
+th { color:#8b98a8; font-weight:500; width:42%; }
+code { background:#0c0f13; padding:.08rem .32rem; border-radius:4px; font-size:.84em; }
+.badge { display:inline-block; padding:.14rem .55rem; border-radius:999px; font-size:.76rem; font-weight:600; }
+.ok { background:#12351f; color:#57d98a; }
+.warn { background:#3a2c0c; color:#e8b339; }
+.bad { background:#3b1418; color:#ff7f86; }
+button { background:#22406e; color:#dce8ff; border:0; border-radius:6px; padding:.38rem .8rem; font-size:.83rem; cursor:pointer; }
+button:hover { background:#2c5288; }
+button.secondary { background:#2a3038; color:#cfd7e2; }
+button.danger { background:#5a1f26; color:#ffd5d8; }
+button:disabled { opacity:.5; cursor:not-allowed; }
+pre { background:#0c0f13; padding:.7rem; border-radius:8px; overflow:auto; max-height:20rem; font-size:.78rem; line-height:1.45; margin:0; }
+.mono { font-variant-numeric: tabular-nums; }
+.big { font-size:1.5rem; font-weight:600; font-variant-numeric: tabular-nums; }
+.row { display:flex; gap:.45rem; flex-wrap:wrap; align-items:center; }
+.muted { color:#8b98a8; font-size:.8rem; }
+ul.events { list-style:none; margin:0; padding:0; font-size:.8rem; max-height:17rem; overflow:auto; }
+ul.events li { padding:.28rem 0; border-bottom:1px solid #1e242c; display:flex; gap:.5rem; }
+ul.events time { color:#6d7a89; flex:0 0 5.4rem; font-variant-numeric: tabular-nums; }
+li.kind-rollback span.msg, li.kind-clamp span.msg { color:#ffb86b; }
+li.kind-source-switch span.msg, li.kind-active-source span.msg { color:#8fc3ff; }
+li.kind-restart span.msg { color:#d2a8ff; }
+input[type=text] { background:#0c0f13; border:1px solid #2b333e; color:#e6e6e6; border-radius:6px; padding:.3rem .5rem; font-size:.84rem; }
+#probe-out { margin-top:.6rem; }
+.err { color:#ff9aa2; }
+</style>
+</head>
+<body>
+<header>
+  <h1>隔离网 NTP 服务</h1>
+  <span id="state-badge" class="badge">…</span>
+  <span class="muted" id="state-detail"></span>
+  <span style="flex:1"></span>
+  <span class="muted" id="refresh-note">每 2 秒刷新</span>
+</header>
+<main>
+  <div class="grid">
+
+    <section class="card">
+      <h2>对外服务状态</h2>
+      <div class="big mono" id="clock-time">–</div>
+      <div class="muted mono" id="clock-iso" style="margin-bottom:.7rem">–</div>
+      <table>
+        <tr><th>同步状态</th><td id="clock-state">–</td></tr>
+        <tr><th>stratum / LI</th><td class="mono" id="clock-stratum">–</td></tr>
+        <tr><th>当前来源</th><td id="clock-source">–</td></tr>
+        <tr><th>最近取样年龄</th><td class="mono" id="clock-age">–</td></tr>
+        <tr><th>保鲜期剩余</th><td class="mono" id="clock-holdover">–</td></tr>
+        <tr><th>根延迟 / 根色散</th><td class="mono" id="clock-root">–</td></tr>
+        <tr><th>refid / ref time</th><td class="mono" id="clock-refid">–</td></tr>
+        <tr><th>与宿主时钟差</th><td class="mono" id="clock-delta">–</td></tr>
+      </table>
+      <div class="row" style="margin-top:.8rem">
+        <button class="secondary" onclick="refreshNow()">立即重新取样</button>
+        <button class="secondary" id="pause-btn" onclick="togglePause()">暂停自动取样</button>
+      </div>
+      <div class="muted" id="daemon-stats" style="margin-top:.5rem"></div>
+    </section>
+
+    <section class="card">
+      <h2>本地上游（可在本页调偏/停用）</h2>
+      <table id="sources-table">
+        <thead><tr><th style="width:auto">来源</th><th>状态</th><th>层/延迟</th><th>操作</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div class="muted" style="margin-top:.6rem">每路均可用真实 NTP 请求探测；也可在各自页面上调偏或停用。</div>
+    </section>
+
+    <section class="card">
+      <h2>发送真实 NTP 请求</h2>
+      <div class="row">
+        <input type="text" id="probe-source" placeholder="来源 id（留空=全部）" size="18">
+        <button onclick="probe()">查询上游</button>
+        <button class="secondary" onclick="probeSelf()">查询本机服务</button>
+      </div>
+      <div id="probe-out" class="muted">尚未发送请求。</div>
+    </section>
+
+    <section class="card" style="grid-column: 1 / -1;">
+      <h2>事件日志</h2>
+      <ul class="events" id="events"></ul>
+    </section>
+
+  </div>
+</main>
+<script>
+const stateNames = {
+  "synced": ["同步中", "ok"],
+  "holdover": ["保鲜期内（上游失联）", "warn"],
+  "holdover-expired": ["保鲜期已过 · 报告未同步", "bad"],
+  "never-synced": ["尚未同步", "bad"],
+};
+
+function fmtAge(s) {
+  if (s === null || s === undefined) return "–";
+  if (s < 120) return s.toFixed(1) + " s";
+  return (s / 60).toFixed(1) + " min";
+}
+
+function setText(id, text) { const el = document.getElementById(id); if (el) el.textContent = text; }
+
+function render(status) {
+  const c = status.clock;
+  const [label, cls] = stateNames[c.state] || [c.state, "bad"];
+  const badge = document.getElementById("state-badge");
+  badge.textContent = label; badge.className = "badge " + cls;
+  setText("state-detail", c.synced ? "" : "对外应答将标记 stratum 16 / LI 3");
+
+  setText("clock-time", new Date(c.unix_time * 1000).toISOString().replace("T", " ").replace("Z", " UTC"));
+  setText("clock-iso", "unix " + c.unix_time.toFixed(3));
+  setText("clock-state", label + "（" + c.state + "）");
+  setText("clock-stratum", c.stratum + " / " + c.leap);
+  setText("clock-source", c.source ? c.source.id + " @ " + c.source.ip + ":" + c.source.port : "—");
+  setText("clock-age", fmtAge(c.last_sample_age));
+  setText("clock-holdover", c.synced ? fmtAge(c.holdover_remaining) + " / " + fmtAge(c.holdover_seconds) : "—");
+  setText("clock-root", c.root_delay.toFixed(6) + " s / " + c.root_dispersion.toFixed(6) + " s");
+  setText("clock-refid", c.refid + (c.ref_ts ? " · " + new Date(c.ref_ts * 1000).toISOString() : ""));
+  setText("clock-delta", (c.host_delta >= 0 ? "+" : "") + c.host_delta.toFixed(3) + " s");
+
+  const srv = status.server;
+  setText("daemon-stats", `UDP ${srv.host}:${srv.port} · 请求 ${srv.requests} · 应答 ${srv.replies} · 拒绝 ${srv.rejected}`);
+
+  const tbody = document.querySelector("#sources-table tbody");
+  tbody.innerHTML = "";
+  for (const s of status.sampler.sources) {
+    const tr = document.createElement("tr");
+    const state = !s.enabled ? '<span class="badge bad">已停用</span>'
+      : s.reachable ? '<span class="badge ok">可达</span>'
+      : '<span class="badge bad">失联</span>';
+    const active = status.sampler.active_source === s.id ? ' <span class="muted">· 当前来源</span>' : "";
+    const err = s.last_error ? `<div class="muted err">${escapeHtml(s.last_error)}</div>` : "";
+    tr.innerHTML = `
+      <td><b>${escapeHtml(s.label)}</b>${active}<div class="muted mono">${escapeHtml(s.address)}</div>${err}</td>
+      <td>${state}<div class="muted">失败 ${s.consecutive_failures} 次</div></td>
+      <td class="mono">${s.stratum ?? "–"} / ${s.rtt != null ? (s.rtt * 1000).toFixed(2) + " ms" : "–"}</td>
+      <td>
+        <button class="secondary" onclick="toggleSource('${s.id}', ${s.enabled ? "false" : "true"})">${s.enabled ? "停用" : "启用"}</button>
+        <button class="secondary" onclick="probe('${s.id}')">探测</button>
+      </td>`;
+    tbody.appendChild(tr);
+  }
+
+  const ev = document.getElementById("events");
+  ev.innerHTML = "";
+  for (const e of status.events) {
+    const li = document.createElement("li");
+    li.className = "kind-" + e.kind;
+    const t = new Date(e.wall * 1000).toISOString().slice(11, 19);
+    li.innerHTML = `<time>${t}</time><span class="msg">${escapeHtml(e.message)}</span>`;
+    ev.appendChild(li);
+  }
+
+  const pb = document.getElementById("pause-btn");
+  pb.textContent = status.sampler.paused ? "恢复自动取样" : "暂停自动取样";
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, ch => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[ch]));
+}
+
+async function getStatus() {
+  const r = await fetch("/api/status"); return r.json();
+}
+async function refreshNow() {
+  const r = await fetch("/api/refresh", {method: "POST"}); render(await r.json());
+}
+async function togglePause() {
+  const status = await getStatus();
+  const r = await fetch("/api/sampler/paused", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({paused: !status.sampler.paused})});
+  render(await r.json());
+}
+async function toggleSource(id, enabled) {
+  const r = await fetch(`/api/sources/${encodeURIComponent(id)}/enabled`, {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({enabled})});
+  render(await r.json());
+}
+async function probe(sourceId) {
+  const input = document.getElementById("probe-source");
+  const sid = sourceId || input.value.trim() || null;
+  const out = document.getElementById("probe-out");
+  out.className = ""; out.innerHTML = "请求中…";
+  const r = await fetch("/api/probe", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({source_id: sid, timeout: 2})});
+  renderProbe(await r.json());
+}
+async function probeSelf() {
+  const out = document.getElementById("probe-out");
+  out.className = ""; out.innerHTML = "请求中…";
+  const r = await fetch("/api/probe/server", {method: "POST"});
+  renderProbe(await r.json());
+}
+function renderProbe(data) {
+  const out = document.getElementById("probe-out");
+  out.innerHTML = data.results.map(res => {
+    const detail = res.ok
+      ? `offset ${res.sample.offset >= 0 ? "+" : ""}${res.sample.offset.toFixed(6)} s · RTT ${(res.sample.rtt*1000).toFixed(3)} ms · 上游时间 ${res.sample.upstream_iso}`
+      : `<span class="err">失败：${escapeHtml(res.error || "unknown")}</span>`;
+    return `<div style="margin:.35rem 0"><code>${escapeHtml(res.address)}</code> ${res.ok ? '<span class="badge ok">有效应答</span>' : '<span class="badge bad">无有效应答</span>'}<div class="muted mono">${detail}</div></div>`;
+  }).join("");
+}
+async function tick() { try { render(await getStatus()); } catch (e) {} }
+tick();
+setInterval(tick, 2000);
+</script>
+</body>
+</html>
